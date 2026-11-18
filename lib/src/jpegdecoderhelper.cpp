@@ -10,7 +10,9 @@
 
 #include <errno.h>
 #include <setjmp.h>
+#include <jerror.h>
 
+#include "ultrahdr_decode_options.h"
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -245,6 +247,14 @@ uhdr_error_info_t JpegDecoderHelper::decode(const void* image, size_t length, de
   jpeg_source_mgr_impl mgr(static_cast<const uint8_t*>(image), length);
   jpeg_decompress_struct cinfo;
   jpeg_error_mgr_impl myerr;
+  jpeg_progress_mgr progress{};
+  progress.progress_monitor = [](j_common_ptr common) {
+    const auto* cancelled = decode_options.cancelled;
+    if (cancelled && *cancelled && (*cancelled)()) {
+      common->err->msg_code = JERR_FILE_READ;
+      common->err->error_exit(common);
+    }
+  };
   uhdr_error_info_t status = g_no_error;
 
   cinfo.err = jpeg_std_error(&myerr);
@@ -254,6 +264,7 @@ uhdr_error_info_t JpegDecoderHelper::decode(const void* image, size_t length, de
   if (0 == setjmp(myerr.setjmp_buffer)) {
     jpeg_create_decompress(&cinfo);
     cinfo.src = &mgr;
+    cinfo.progress = &progress;
     jpeg_save_markers(&cinfo, kAPP0Marker, 0xFFFF);
     jpeg_save_markers(&cinfo, kAPP1Marker, 0xFFFF);
     jpeg_save_markers(&cinfo, kAPP2Marker, 0xFFFF);

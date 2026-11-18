@@ -15,6 +15,7 @@
 #include <unistd.h>
 #endif
 
+#include "ultrahdr_decode_options.h"
 #include <condition_variable>
 #include <deque>
 #include <functional>
@@ -131,6 +132,17 @@ class AlogMessageWriter : public MessageWriter {
 };
 
 unsigned int GetCPUCoreCount() { return (std::max)(1u, std::thread::hardware_concurrency()); }
+
+namespace {
+// Preserve upstream's four-thread cap while honoring the shared decode lease.
+int gainMapThreads()
+{
+    constexpr unsigned int kMaximumGainMapThreads = 4;
+    const auto threads = decode_options.threads > 0 ? unsigned(decode_options.threads)
+                                                    : GetCPUCoreCount();
+    return (std::min)(threads, kMaximumGainMapThreads);
+}
+}  // namespace
 
 JpegR::JpegR(void* uhdrGLESCtxt, int mapDimensionScaleFactor, int mapCompressQuality,
              bool useMultiChannelGainMap, float gamma, uhdr_enc_preset_t preset,
@@ -742,7 +754,7 @@ uhdr_error_info_t UltraHdr::generateGainMap(uhdr_raw_image_t* sdr_intent,
     float log2MinBoost = log2(gainmap_metadata->min_content_boost[0]);
     float log2MaxBoost = log2(gainmap_metadata->max_content_boost[0]);
 
-    const int threads = (std::min)(GetCPUCoreCount(), 4u);
+    const int threads = gainMapThreads();
     const int jobSizeInRows = 1;
     unsigned int rowStep = threads == 1 ? map_height : jobSizeInRows;
     JobQueue jobQueue;
@@ -855,7 +867,7 @@ uhdr_error_info_t UltraHdr::generateGainMap(uhdr_raw_image_t* sdr_intent,
     float gainmap_max[3] = {-128.0f, -128.0f, -128.0f};
     std::mutex gainmap_minmax;
 
-    const int threads = (std::min)(GetCPUCoreCount(), 4u);
+    const int threads = gainMapThreads();
     const int jobSizeInRows = 1;
     unsigned int rowStep = threads == 1 ? map_height : jobSizeInRows;
     JobQueue jobQueue;
@@ -1756,19 +1768,21 @@ uhdr_error_info_t UltraHdr::applyGainMap(uhdr_raw_image_t* sdr_intent, uhdr_raw_
   }
 
   JobQueue jobQueue;
+  const auto cancelled = decode_options.cancelled ? *decode_options.cancelled : std::function<bool()>{};
   std::function<void()> applyRecMap = [sdr_intent, gainmap_img, dest, &jobQueue, &idwTable,
                                        output_ct, &gainLUT, gainmap_metadata, hdrGamutConversionFn,
                                        sdrGamutConversionFn,
 #if !USE_APPLY_GAIN_LUT
                                        gainmap_weight,
 #endif
-                                       map_scale_factor, get_pixel_fn]() -> void {
+                                       map_scale_factor, get_pixel_fn, cancelled]() -> void {
     unsigned int width = sdr_intent->w;
     unsigned int rowStart, rowEnd;
     const bool isSdrIntentRgb = isPixelFormatRgb(sdr_intent->fmt);
 
     while (jobQueue.dequeueJob(rowStart, rowEnd)) {
       for (size_t y = rowStart; y < rowEnd; ++y) {
+        if (cancelled && cancelled()) return;
         for (size_t x = 0; x < width; ++x) {
           Color rgb_gamma_sdr;
 
@@ -1868,7 +1882,7 @@ uhdr_error_info_t UltraHdr::applyGainMap(uhdr_raw_image_t* sdr_intent, uhdr_raw_
     }
   };
 
-  const int threads = (std::min)(GetCPUCoreCount(), 4u);
+  const int threads = gainMapThreads();
   std::vector<std::thread> workers;
   for (int th = 0; th < threads - 1; th++) {
     workers.push_back(std::thread(applyRecMap));
@@ -1883,6 +1897,13 @@ uhdr_error_info_t UltraHdr::applyGainMap(uhdr_raw_image_t* sdr_intent, uhdr_raw_
   applyRecMap();
   std::for_each(workers.begin(), workers.end(), [](std::thread& t) { t.join(); });
 
+  if (cancelled && cancelled()) {
+    uhdr_error_info_t status = g_no_error;
+    status.error_code = UHDR_CODEC_ERROR;
+    status.has_detail = 1;
+    snprintf(status.detail, sizeof status.detail, "HDR decoding cancelled");
+    return status;
+  }
   return g_no_error;
 }
 
@@ -2317,7 +2338,7 @@ uhdr_error_info_t UltraHdr::toneMap(uhdr_raw_image_t* hdr_intent, uhdr_raw_image
   ColorTransformFn hdrGamutConversionFn = getGamutConversionFn(sdr_intent->cg, hdr_intent->cg);
 
   unsigned int height = hdr_intent->h;
-  const int threads = (std::min)(GetCPUCoreCount(), 4u);
+  const int threads = gainMapThreads();
   // for 420 subsampling, process 2 rows at once
   const int jobSizeInRows = hdr_intent->fmt == UHDR_IMG_FMT_24bppYCbCrP010 ? 2 : 1;
   unsigned int rowStep = threads == 1 ? height : jobSizeInRows;
